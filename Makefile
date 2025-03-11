@@ -2,35 +2,35 @@
 
 # Build Docker image
 build:
-	docker-compose build
+	docker compose build
 
 # Start all services
 up:
-	docker-compose up -d
+	docker compose up -d
 
 # Stop all services
 down:
-	docker-compose down
+	docker compose down
 
 # Show running containers
 ps:
-	docker-compose ps
+	docker compose ps
 
 # Show logs
 logs:
-	docker-compose logs -f
+	docker compose logs -f
 
 # Show logs for a specific service
 logs-%:
-	docker-compose logs -f $*
+	docker compose logs -f $*
 
 # Restart all services
 restart:
-	docker-compose restart
+	docker compose restart
 
 # Restart a specific service
 restart-%:
-	docker-compose restart $*
+	docker compose restart $*
 
 # Initialize MinIO buckets
 init-minio:
@@ -57,7 +57,7 @@ monitor-kafka:
 
 # Clean up resources
 clean:
-	docker-compose down -v
+	docker compose down -v
 	docker system prune -f
 
 # Create sample data

@@ -60,6 +60,55 @@
 
 首先，我们需要准备一个稳定的开发环境。我们使用Docker和Docker Compose来确保环境的一致性和可重现性。
 
+### 目录结构
+
+我们的项目目录结构如下：
+
+```
+.
+├── Dockerfile
+├── Makefile
+├── README.md
+├── docker-compose.yml
+├── docs
+│   ├── architecture.png
+│   ├── architecture.svg
+│   ├── blog_post.md
+│   └── phase2.md
+├── jars
+├── pom.xml
+├── scripts
+│   ├── init-db.sql
+│   ├── monitor-kafka.sh
+│   └── verify-cdc.sh
+└── src
+    ├── main
+    │   ├── java
+    │   │   └── com
+    │   │       └── dataworkshub
+    │   │           └── datalake
+    │   │               ├── DataLakeApp.java
+    │   │               ├── cdc
+    │   │               │   └── PostgresCdcSource.java
+    │   │               ├── config
+    │   │               │   └── AppConfig.java
+    │   │               ├── kafka
+    │   │               │   └── KafkaManager.java
+    │   │               └── util
+    │   │                   └── CdcJsonUtils.java
+    │   └── resources
+    │       └── log4j.properties
+    └── test
+        └── java
+            └── com
+                └── dataworkshub
+                    └── datalake
+                        ├── cdc
+                        │   └── PostgresCdcSourceTest.java
+                        └── kafka
+                            └── KafkaManagerTest.java
+```
+
 #### 环境变量配置
 
 我们使用`.env`文件管理环境变量:
@@ -69,7 +118,7 @@ KAFKA_GROUP=data_lake_group
 KAFKA_TOPIC=postgresql_cdc
 KAFKA_URL=kafka:9092
 
-FLINK_VERSION=1.16.0
+FLINK_VERSION=1.16.2
 JAVA_VERSION=11
 
 POSTGRES_URL=jdbc:postgresql://postgres:5432/postgres
@@ -77,6 +126,9 @@ JDBC_BASE_URL=jdbc:postgresql://postgres:5432
 POSTGRES_USER=postgres
 POSTGRES_PASSWORD=postgres
 POSTGRES_DB=postgres
+
+MINIO_ACCESS_KEY=minioadmin
+MINIO_SECRET_KEY=minioadmin
 ```
 
 #### Dockerfile
@@ -88,19 +140,27 @@ FROM flink:1.16.2
 
 # 安装JDK 11
 RUN apt-get update && \
-    apt-get install -y openjdk-11-jdk && \
+    apt-get install -y openjdk-11-jdk maven && \
     apt-get clean;
 
 # 设置环境变量
 ENV JAVA_HOME=/usr/lib/jvm/java-11-openjdk-amd64
 
+# 列出内容进行验证
+RUN ls -la /opt/flink/lib/
+
 # 下载连接器库
 RUN wget -P /opt/flink/lib/ https://repo.maven.apache.org/maven2/org/apache/flink/flink-sql-connector-kafka/1.16.2/flink-sql-connector-kafka-1.16.2.jar && \
     wget -P /opt/flink/lib/ https://repo.maven.apache.org/maven2/org/apache/flink/flink-connector-jdbc/1.16.2/flink-connector-jdbc-1.16.2.jar && \
     wget -P /opt/flink/lib/ https://repo1.maven.org/maven2/org/postgresql/postgresql/42.2.26/postgresql-42.2.26.jar && \
-    wget -P /opt/flink/lib/ https://repo.maven.apache.org/maven2/org/apache/flink/flink-sql-connector-postgres-cdc/2.3.0/flink-sql-connector-postgres-cdc-2.3.0.jar && \
+    wget -P /opt/flink/lib/ https://repo.maven.apache.org/maven2/com/ververica/flink-sql-connector-postgres-cdc/2.3.0/flink-sql-connector-postgres-cdc-2.3.0.jar && \
     wget -P /opt/flink/lib/ https://repo.maven.apache.org/maven2/org/apache/iceberg/iceberg-flink-runtime-1.16/1.3.0/iceberg-flink-runtime-1.16-1.3.0.jar
 
+# 创建应用程序目录
+RUN mkdir -p /opt/flink/usrlib
+RUN mkdir -p /opt/src
+
+# 设置工作目录
 WORKDIR /opt/flink
 ```
 
@@ -128,61 +188,76 @@ services:
 
   # Zookeeper服务（Kafka依赖）
   zookeeper:
-    image: wurstmeister/zookeeper:3.4.6
+    image: bitnami/zookeeper:latest
     container_name: zookeeper
     ports:
       - "2181:2181"
+    environment:
+      - ALLOW_ANONYMOUS_LOGIN=yes
 
   # Kafka消息队列
   kafka:
-    image: wurstmeister/kafka:2.13-2.8.1
+    image: bitnami/kafka:latest
     container_name: kafka
     ports:
       - "9092:9092"
     environment:
-      - KAFKA_ADVERTISED_HOST_NAME=kafka
-      - KAFKA_ZOOKEEPER_CONNECT=zookeeper:2181
-      - KAFKA_CREATE_TOPICS=${KAFKA_TOPIC:-postgresql_cdc}:1:1
+      - KAFKA_CFG_ZOOKEEPER_CONNECT=zookeeper:2181
+      - KAFKA_CFG_ADVERTISED_LISTENERS=PLAINTEXT://kafka:9092
+      - ALLOW_PLAINTEXT_LISTENER=yes
+      - KAFKA_CFG_AUTO_CREATE_TOPICS_ENABLE=true
+      - KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP=PLAINTEXT:PLAINTEXT
     depends_on:
       - zookeeper
     volumes:
-      - kafka_data:/var/lib/kafka/data
+      - kafka_data:/bitnami/kafka
 
   # Flink JobManager
   jobmanager:
     build: .
     image: datalake-flink:latest
+    pull_policy: never
     container_name: jobmanager
+    hostname: jobmanager
     ports:
       - "8081:8081"
+    expose:
+      - "6123"
+    volumes:
+      - ./:/opt/flink/usrlib
+      - ./src:/opt/src
+    command: jobmanager
     environment:
       - POSTGRES_URL=${POSTGRES_URL:-jdbc:postgresql://postgres:5432/postgres}
       - POSTGRES_USER=${POSTGRES_USER:-postgres}
       - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-postgres}
       - POSTGRES_DB=${POSTGRES_DB:-postgres}
-      - KAFKA_URL=${KAFKA_URL:-kafka:9092}
       - |
         FLINK_PROPERTIES=
         jobmanager.rpc.address: jobmanager
-    volumes:
-      - ./src:/opt/flink/usrlib
-      - ./jars:/opt/flink/lib
+        taskmanager.registration.timeout: 5 min
 
   # Flink TaskManager
   taskmanager:
+    build: .
     image: datalake-flink:latest
+    pull_policy: never
     container_name: taskmanager
+    expose:
+      - "6121"
+      - "6122"
     depends_on:
       - jobmanager
+    volumes:
+      - ./:/opt/flink/usrlib
+      - ./src:/opt/src
+    command: taskmanager
     environment:
       - |
         FLINK_PROPERTIES=
         jobmanager.rpc.address: jobmanager
         taskmanager.numberOfTaskSlots: 4
         parallelism.default: 2
-    volumes:
-      - ./src:/opt/flink/usrlib
-      - ./jars:/opt/flink/lib
 
   # MinIO作为Iceberg的存储后端
   minio:
@@ -192,8 +267,8 @@ services:
       - "9000:9000"
       - "9001:9001"
     environment:
-      - MINIO_ACCESS_KEY=minioadmin
-      - MINIO_SECRET_KEY=minioadmin
+      - MINIO_ROOT_USER=${MINIO_ACCESS_KEY:-minioadmin}
+      - MINIO_ROOT_PASSWORD=${MINIO_SECRET_KEY:-minioadmin}
     volumes:
       - minio_data:/data
     command: server /data --console-address ":9001"
@@ -209,29 +284,90 @@ volumes:
 创建Makefile简化操作命令：
 
 ```makefile
-.PHONY: build up down ps logs restart clean
+.PHONY: build up down ps logs restart clean init-minio verify-cdc test-cdc monitor-kafka
 
+# Build Docker image
 build:
-	docker-compose build
+	docker compose build
 
+# Start all services
 up:
-	docker-compose up -d
+	docker compose up -d
 
+# Stop all services
 down:
-	docker-compose down
+	docker compose down
 
+# Show running containers
 ps:
-	docker-compose ps
+	docker compose ps
 
+# Show logs
 logs:
-	docker-compose logs -f
+	docker compose logs -f
 
+# Show logs for a specific service
+logs-%:
+	docker compose logs -f $*
+
+# Restart all services
 restart:
-	docker-compose restart
+	docker compose restart
 
+# Restart a specific service
+restart-%:
+	docker compose restart $*
+
+# Initialize MinIO buckets
+init-minio:
+	docker exec -it minio mkdir -p /data/warehouse
+	docker exec -it minio mkdir -p /data/staging
+
+# Verify CDC setup
+verify-cdc:
+	./scripts/verify-cdc.sh
+
+# Test CDC by making changes to PostgreSQL
+test-cdc:
+	@echo "Inserting a new customer record..."
+	docker exec -it postgres psql -U postgres -c "INSERT INTO customers (name, email) VALUES ('测试用户', 'test@example.com');"
+	@echo "Updating an existing customer record..."
+	docker exec -it postgres psql -U postgres -c "UPDATE customers SET name = '更新用户' WHERE email = 'test@example.com';"
+	@echo "Deleting the test customer record..."
+	docker exec -it postgres psql -U postgres -c "DELETE FROM customers WHERE email = 'test@example.com';"
+	@echo "CDC test complete. Check Kafka topic for events."
+
+# Monitor Kafka topic for CDC events
+monitor-kafka:
+	./scripts/monitor-kafka.sh
+
+# Clean up resources
 clean:
-	docker-compose down -v
+	docker compose down -v
 	docker system prune -f
+
+# Create sample data
+sample-data:
+	docker exec -it postgres psql -U postgres -d postgres -f /docker-entrypoint-initdb.d/init-db.sql
+
+# Help command
+help:
+	@echo "Available commands:"
+	@echo "  make build        - Build Docker images"
+	@echo "  make up           - Start all services"
+	@echo "  make down         - Stop all services"
+	@echo "  make ps           - Show running containers"
+	@echo "  make logs         - Show logs for all services"
+	@echo "  make logs-SERVICE - Show logs for a specific service"
+	@echo "  make restart      - Restart all services"
+	@echo "  make restart-SERVICE - Restart a specific service"
+	@echo "  make init-minio   - Initialize MinIO buckets"
+	@echo "  make verify-cdc   - Verify PostgreSQL CDC setup"
+	@echo "  make test-cdc     - Test CDC by making changes to PostgreSQL"
+	@echo "  make monitor-kafka - Monitor Kafka topic for CDC events"
+	@echo "  make clean        - Clean up resources"
+	@echo "  make sample-data  - Create sample data in PostgreSQL"
+	@echo "  make help         - Show this help message"
 ```
 
 #### 初始化数据库脚本
@@ -282,10 +418,121 @@ FOR EACH ROW
 EXECUTE FUNCTION update_modified_column();
 ```
 
+## Maven配置
+
+我们使用Maven进行项目管理，配置如下：
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <groupId>com.dataworkshub</groupId>
+    <artifactId>datalake</artifactId>
+    <version>1.0-SNAPSHOT</version>
+    <packaging>jar</packaging>
+
+    <name>Data Lake Real-time Warehouse</name>
+    <description>A real-time data warehouse using PostgreSQL, Flink CDC, Kafka, Flink, and Iceberg</description>
+
+    <properties>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+        <maven.compiler.source>11</maven.compiler.source>
+        <maven.compiler.target>11</maven.compiler.target>
+        <flink.version>1.16.2</flink.version>
+        <java.version>11</java.version>
+        <scala.binary.version>2.12</scala.binary.version>
+        <kafka.version>3.2.0</kafka.version>
+        <iceberg.version>1.3.0</iceberg.version>
+        <postgres.version>42.2.26</postgres.version>
+        <flink.cdc.version>2.3.0</flink.cdc.version>
+    </properties>
+
+    <dependencies>
+        <!-- Apache Flink Core -->
+        <dependency>
+            <groupId>org.apache.flink</groupId>
+            <artifactId>flink-java</artifactId>
+            <version>${flink.version}</version>
+            <scope>provided</scope>
+        </dependency>
+        <!-- 其他依赖项 -->
+    </dependencies>
+
+    <build>
+        <plugins>
+            <!-- Maven插件配置 -->
+        </plugins>
+    </build>
+</project>
+```
+
+## 非交互式测试命令
+
+以下是用于测试架构各组件的非交互式命令：
+
+### 1. PostgreSQL
+
+```bash
+# 测试PostgreSQL连接
+docker exec postgres psql -U postgres -c "SELECT 1 as connection_test;"
+
+# 检查表是否创建成功
+docker exec postgres psql -U postgres -c "SELECT table_name FROM information_schema.tables WHERE table_schema='public';"
+
+# 检查示例数据是否插入
+docker exec postgres psql -U postgres -c "SELECT COUNT(*) FROM customers;"
+```
+
+### 2. Kafka和Zookeeper
+
+```bash
+# 检查Kafka是否运行
+docker exec kafka kafka-topics.sh --bootstrap-server kafka:9092 --list
+
+# 创建测试主题
+docker exec kafka kafka-topics.sh --bootstrap-server kafka:9092 --create --topic test-topic --partitions 1 --replication-factor 1
+
+# 生产测试消息（非交互式）
+echo "test message" | docker exec -i kafka kafka-console-producer.sh --bootstrap-server kafka:9092 --topic test-topic
+
+# 消费消息（带超时以避免无限期等待）
+docker exec kafka kafka-console-consumer.sh --bootstrap-server kafka:9092 --topic test-topic --from-beginning --max-messages 1 --timeout-ms 5000
+```
+
+### 3. MinIO
+
+```bash
+# 检查MinIO是否运行
+docker exec minio curl -s -o /dev/null -w "%{http_code}" http://localhost:9000
+
+# 使用MinIO Client(mc)创建测试桶
+docker exec minio mc alias set local http://localhost:9000 minioadmin minioadmin
+docker exec minio mc mb local/test-bucket
+
+# 列出桶
+docker exec minio mc ls local/
+```
+
+### 4. Flink
+
+```bash
+# 检查JobManager是否运行
+curl -s http://localhost:8081/overview
+
+# 检查Flink TaskManager
+curl -s http://localhost:8081/taskmanagers | grep "taskmanagers"
+
+# 提交测试作业（假设jars目录中有一个测试jar）
+docker exec jobmanager flink run -d /opt/flink/examples/streaming/WordCount.jar
+```
+
 ## 总结与展望
 
 在这篇博文中，我们详细介绍了实时数据湖仓库的架构设计和第一阶段的环境搭建。后续文章将继续深入探讨如何实现CDC数据捕获、Kafka消息处理、Flink流处理以及Iceberg数据湖集成。
 
 通过这种渐进式的开发方法，我们不仅能够逐步构建复杂的数据处理系统，还能确保每个组件的正常运行，为后续的扩展和优化奠定坚实基础。
 
-敬请期待下一篇文章，我们将详细讲解如何使用Flink CDC捕获PostgreSQL数据变更并将其发送到Kafka！ 
+敬请期待下一篇文章，我们将详细讲解如何使用Flink CDC捕获PostgreSQL数据变更并将其发送到Kafka！
